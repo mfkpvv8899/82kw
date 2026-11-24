@@ -115,8 +115,6 @@ jobs:
               private lateinit var search: EditText
               private val ad = Ad()
               private val prov = HashMap<String, ViewOutlineProvider>()
-              private val DEF = setOf("com.whatsapp", "com.google.android.googlequicksearchbox",
-                  "com.zhiliaoapp.musically", "com.ss.android.ugc.trill", "com.instagram.android")
               private val rcv = object : BroadcastReceiver() { override fun onReceive(c: Context, i: Intent) = load() }
           
               private fun dp(v: Float) = (v * resources.displayMetrics.density).toInt()
@@ -144,18 +142,17 @@ jobs:
                       override fun beforeTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {}
                       override fun onTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {} })
                   search.setOnEditorActionListener { _, _, _ -> ad.list.firstOrNull()?.let { launch(search, it) }; true }
-                  val gear = TextView(this).apply { text = "⚙"; textSize = 22f; setTextColor(-1); gravity = Gravity.CENTER
-                      setOnClickListener { startActivity(Intent(this@MainActivity, SettingsActivity::class.java)) } }
                   val frame = FrameLayout(this).apply {
                       addView(pill, FrameLayout.LayoutParams(-2, dp(36f), Gravity.CENTER))
                       addView(search, FrameLayout.LayoutParams(-1, dp(40f))) }
-                  val bar = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL
-                      addView(View(context), LinearLayout.LayoutParams(dp(44f), 1))
-                      addView(frame, LinearLayout.LayoutParams(0, -2, 1f))
-                      addView(gear, LinearLayout.LayoutParams(dp(44f), dp(44f))) }
+                  val bar = LinearLayout(this).apply { gravity = Gravity.CENTER
+                      addView(frame, LinearLayout.LayoutParams(-1, -2)) }
                   root.addView(bar, LinearLayout.LayoutParams(-1, -2))
                   dock = LinearLayout(this).apply { setPadding(dp(6f), dp(6f), dp(6f), dp(6f)) }
                   root.addView(dock, LinearLayout.LayoutParams(-1, -2).apply { setMargins(dp(12f), dp(8f), dp(12f), dp(12f)) })
+                  val sets = View.OnLongClickListener { startActivity(Intent(this@MainActivity, SettingsActivity::class.java)); true }
+                  root.setOnLongClickListener(sets); grid.setOnLongClickListener(sets)
+                  dock.setOnLongClickListener(sets); pill.setOnLongClickListener(sets)
                   setContentView(root)
                   val f = IntentFilter().apply { addAction(Intent.ACTION_PACKAGE_ADDED); addAction(Intent.ACTION_PACKAGE_REMOVED)
                       addAction(Intent.ACTION_PACKAGE_CHANGED); addDataScheme("package") }
@@ -191,12 +188,7 @@ jobs:
               }
           
               private fun hidden() = (U.sp.getStringSet("hidden", emptySet()) ?: emptySet()).toSet()
-              private fun dockKeys(): List<String> {
-                  var s = U.sp.getString("dock", null)
-                  if (s == null) { s = all.filter { it.cn.packageName in DEF }.joinToString(",") { it.cn.flattenToString() }
-                      if (all.isNotEmpty()) U.sp.edit().putString("dock", s).apply() }
-                  return s.split(",").filter { it.isNotEmpty() }
-              }
+              private fun dockKeys() = (U.sp.getString("dockapps", "") ?: "").split(",").filter { it.isNotEmpty() }
           
               private fun render() {
                   val sc = U.i("scale", 100) / 100f
@@ -209,10 +201,11 @@ jobs:
                   val th = U.s("dtheme", "Escuro")
                   dock.background = bubble(if (th == "Claro") 0xFFFFFF else 0x000000,
                       if (th == "Transparente") 0 else U.i("dalpha", 40), U.i("dround", 24) * 1f)
-                  dock.visibility = if (U.b("dock", true)) View.VISIBLE else View.GONE
+                  val keys = dockKeys()
+                  dock.visibility = if (U.b("showdock", true) && keys.isNotEmpty()) View.VISIBLE else View.GONE
                   dock.removeAllViews()
                   val ds = dp(U.i("dicon", 56) * sc)
-                  dockKeys().mapNotNull { k -> all.find { it.cn.flattenToString() == k } }.forEach { a ->
+                  keys.mapNotNull { k -> all.find { it.cn.flattenToString() == k } }.forEach { a ->
                       val c = cell(this); bind(c, a, ds, U.b("dlabels", false))
                       dock.addView(c, LinearLayout.LayoutParams(0, -2, 1f)) }
                   filter()
@@ -248,7 +241,7 @@ jobs:
                           1 -> startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse(p)))
                           2 -> { val l = dockKeys().toMutableList()
                               if (inDock) l.remove(k) else if (l.size < 5) l.add(k) else toast("Dock cheia (máx. 5)")
-                              U.sp.edit().putString("dock", l.joinToString(",")).apply(); render() }
+                              U.sp.edit().putString("dockapps", l.joinToString(",")).apply(); render() }
                           3 -> { U.sp.edit().putStringSet("hidden", hidden() + k).apply(); render() }
                           else -> {} } }.show()
               }
@@ -332,7 +325,7 @@ jobs:
               Opt("side", "Margem lateral", 8, 0, 32, u = " dp"),
               Opt("sort", "Ordem dos apps", "A–Z", ch = listOf("A–Z", "Z–A", "Mais recentes", "Mais antigos")),
               Opt("#", "DOCK"),
-              Opt("dock", "Mostrar dock", true),
+              Opt("showdock", "Mostrar dock", true),
               Opt("dicon", "Tamanho dos ícones da dock", 56, 36, 72, u = " dp"),
               Opt("dalpha", "Opacidade da dock", 40, 0, 100, u = "%"),
               Opt("dround", "Cantos da dock", 24, 0, 40, u = " dp"),
