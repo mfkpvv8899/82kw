@@ -6,7 +6,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -14,13 +13,401 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.9
-      - name: Compilar
+      - name: Criar projeto
         run: |
-          [ -f LiteLauncher.zip ] && unzip -oq LiteLauncher.zip -d src
-          S=$(find . -name settings.gradle.kts -not -path "./.git/*" | head -1)
-          cd "$(dirname "$S")"
-          gradle assembleDebug
+          mkdir -p LiteLauncher/app/src/main/java/com/lite/launcher
+          cd LiteLauncher
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "LiteLauncher"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.lite.launcher"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.lite.launcher"; minSdk = 24; targetSdk = 34; versionCode = 2; versionName = "2.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies { implementation("androidx.recyclerview:recyclerview:1.3.2") }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES"/>
+              <queries><intent><action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/></intent></queries>
+              <application android:label="LiteLauncher" android:allowBackup="false"
+                  android:theme="@android:style/Theme.DeviceDefault.Wallpaper.NoTitleBar">
+                  <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTask"
+                      android:stateNotNeeded="true" android:excludeFromRecents="true" android:windowSoftInputMode="adjustPan">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.HOME"/>
+                          <category android:name="android.intent.category.DEFAULT"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <activity android:name=".SettingsActivity" android:exported="false"
+                      android:theme="@android:style/Theme.DeviceDefault.Light"/>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/lite/launcher/MainActivity.kt <<'EOF'
+          package com.lite.launcher
+          
+          import android.app.Activity
+          import android.app.ActivityOptions
+          import android.app.AlertDialog
+          import android.content.*
+          import android.graphics.*
+          import android.graphics.drawable.Drawable
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.*
+          import android.provider.Settings
+          import android.text.Editable
+          import android.text.TextUtils
+          import android.text.TextWatcher
+          import android.util.LruCache
+          import android.view.*
+          import android.view.inputmethod.EditorInfo
+          import android.view.inputmethod.InputMethodManager
+          import android.widget.*
+          import androidx.recyclerview.widget.GridLayoutManager
+          import androidx.recyclerview.widget.RecyclerView
+          import java.util.concurrent.Executors
+          
+          class App(val label: String, val cn: ComponentName, val t: Long, val icon: () -> Drawable)
+          
+          object U {
+              lateinit var sp: SharedPreferences
+              fun init(c: Context) { if (!::sp.isInitialized) sp = c.getSharedPreferences("p", 0) }
+              fun i(k: String, d: Int) = sp.getInt(k, d)
+              fun b(k: String, d: Boolean) = sp.getBoolean(k, d)
+              fun s(k: String, d: String) = sp.getString(k, d) ?: d
+              val cache = LruCache<String, Drawable>(200)
+              val io = Executors.newFixedThreadPool(2)
+              val ui = Handler(Looper.getMainLooper())
+              val colors = mapOf("Branco" to 0xFFFFFFFF.toInt(), "Preto" to 0xFF000000.toInt(),
+                  "Cinza" to 0xFFBBBBBB.toInt(), "Amarelo" to 0xFFFFE082.toInt())
+          }
+          
+          class MainActivity : Activity() {
+              private val bg = Executors.newSingleThreadExecutor()
+              private var all = listOf<App>()
+              private lateinit var root: LinearLayout
+              private lateinit var grid: RecyclerView
+              private lateinit var dock: LinearLayout
+              private lateinit var pill: TextView
+              private lateinit var search: EditText
+              private val ad = Ad()
+              private val prov = HashMap<String, ViewOutlineProvider>()
+              private val DEF = setOf("com.whatsapp", "com.google.android.googlequicksearchbox",
+                  "com.zhiliaoapp.musically", "com.ss.android.ugc.trill", "com.instagram.android")
+              private val rcv = object : BroadcastReceiver() { override fun onReceive(c: Context, i: Intent) = load() }
+          
+              private fun dp(v: Float) = (v * resources.displayMetrics.density).toInt()
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+              private fun fresh(d: Drawable) = d.constantState?.newDrawable() ?: d
+              private fun bubble(rgb: Int, a: Int, r: Float) = GradientDrawable().apply {
+                  setColor((a * 255 / 100 shl 24) or rgb); cornerRadius = dp(r).toFloat() }
+          
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s); U.init(this)
+                  root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; fitsSystemWindows = true }
+                  grid = RecyclerView(this).apply {
+                      layoutManager = GridLayoutManager(this@MainActivity, 4); adapter = ad
+                      clipToPadding = false; setHasFixedSize(true) }
+                  root.addView(grid, LinearLayout.LayoutParams(-1, 0, 1f))
+                  pill = TextView(this).apply { text = "🔍  Buscar"; setTextColor(-1); textSize = 14f
+                      gravity = Gravity.CENTER; setPadding(dp(22f), 0, dp(22f), 0)
+                      background = bubble(0x000000, 40, 20f); setOnClickListener { openSearch() } }
+                  search = EditText(this).apply { visibility = View.GONE; hint = "Buscar apps"
+                      setHintTextColor(0xAAFFFFFF.toInt()); setTextColor(-1); isSingleLine = true
+                      imeOptions = EditorInfo.IME_ACTION_GO; textSize = 15f
+                      setPadding(dp(16f), 0, dp(16f), 0); background = bubble(0x000000, 40, 20f) }
+                  search.addTextChangedListener(object : TextWatcher {
+                      override fun afterTextChanged(e: Editable?) = filter()
+                      override fun beforeTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {}
+                      override fun onTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {} })
+                  search.setOnEditorActionListener { _, _, _ -> ad.list.firstOrNull()?.let { launch(search, it) }; true }
+                  val gear = TextView(this).apply { text = "⚙"; textSize = 22f; setTextColor(-1); gravity = Gravity.CENTER
+                      setOnClickListener { startActivity(Intent(this@MainActivity, SettingsActivity::class.java)) } }
+                  val frame = FrameLayout(this).apply {
+                      addView(pill, FrameLayout.LayoutParams(-2, dp(36f), Gravity.CENTER))
+                      addView(search, FrameLayout.LayoutParams(-1, dp(40f))) }
+                  val bar = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL
+                      addView(View(context), LinearLayout.LayoutParams(dp(44f), 1))
+                      addView(frame, LinearLayout.LayoutParams(0, -2, 1f))
+                      addView(gear, LinearLayout.LayoutParams(dp(44f), dp(44f))) }
+                  root.addView(bar, LinearLayout.LayoutParams(-1, -2))
+                  dock = LinearLayout(this).apply { setPadding(dp(6f), dp(6f), dp(6f), dp(6f)) }
+                  root.addView(dock, LinearLayout.LayoutParams(-1, -2).apply { setMargins(dp(12f), dp(8f), dp(12f), dp(12f)) })
+                  setContentView(root)
+                  val f = IntentFilter().apply { addAction(Intent.ACTION_PACKAGE_ADDED); addAction(Intent.ACTION_PACKAGE_REMOVED)
+                      addAction(Intent.ACTION_PACKAGE_CHANGED); addDataScheme("package") }
+                  if (Build.VERSION.SDK_INT >= 33) registerReceiver(rcv, f, Context.RECEIVER_EXPORTED) else registerReceiver(rcv, f)
+                  load()
+              }
+          
+              override fun onResume() { super.onResume(); render() }
+              override fun onNewIntent(i: Intent?) { super.onNewIntent(i); closeSearch()
+                  if (U.b("top", true)) grid.scrollToPosition(0) }
+              @Deprecated("Deprecated") override fun onBackPressed() { closeSearch() }
+              override fun onDestroy() { unregisterReceiver(rcv); bg.shutdown(); super.onDestroy() }
+          
+              private fun openSearch() {
+                  pill.visibility = View.GONE; search.visibility = View.VISIBLE; search.requestFocus()
+                  if (U.b("kbd", true)) search.post { (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).showSoftInput(search, 0) }
+              }
+              private fun closeSearch() {
+                  if (search.visibility != View.VISIBLE) return
+                  search.setText(""); search.visibility = View.GONE
+                  (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(search.windowToken, 0)
+                  render()
+              }
+          
+              private fun load() = bg.execute {
+                  val pm = packageManager
+                  all = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+                      .filter { it.activityInfo.packageName != packageName }
+                      .map { ri -> val p = ri.activityInfo.packageName
+                          val t = try { pm.getPackageInfo(p, 0).firstInstallTime } catch (e: Exception) { 0L }
+                          App(ri.loadLabel(pm).toString(), ComponentName(p, ri.activityInfo.name), t) { ri.loadIcon(pm) } }
+                  runOnUiThread { render() }
+              }
+          
+              private fun hidden() = (U.sp.getStringSet("hidden", emptySet()) ?: emptySet()).toSet()
+              private fun dockKeys(): List<String> {
+                  var s = U.sp.getString("dock", null)
+                  if (s == null) { s = all.filter { it.cn.packageName in DEF }.joinToString(",") { it.cn.flattenToString() }
+                      if (all.isNotEmpty()) U.sp.edit().putString("dock", s).apply() }
+                  return s.split(",").filter { it.isNotEmpty() }
+              }
+          
+              private fun render() {
+                  val sc = U.i("scale", 100) / 100f
+                  (grid.layoutManager as GridLayoutManager).spanCount = U.i("cols", 4)
+                  val m = dp(U.i("side", 8) * 1f)
+                  grid.setPadding(m, dp(12f), m, dp(8f))
+                  root.setBackgroundColor(Color.argb(U.i("dim", 15) * 255 / 100, 0, 0, 0))
+                  window.decorView.systemUiVisibility = if (U.b("hidesb", false)) View.SYSTEM_UI_FLAG_FULLSCREEN else 0
+                  pill.visibility = if (U.b("search", true) && search.visibility != View.VISIBLE) View.VISIBLE else View.GONE
+                  val th = U.s("dtheme", "Escuro")
+                  dock.background = bubble(if (th == "Claro") 0xFFFFFF else 0x000000,
+                      if (th == "Transparente") 0 else U.i("dalpha", 40), U.i("dround", 24) * 1f)
+                  dock.visibility = if (U.b("dock", true)) View.VISIBLE else View.GONE
+                  dock.removeAllViews()
+                  val ds = dp(U.i("dicon", 56) * sc)
+                  dockKeys().mapNotNull { k -> all.find { it.cn.flattenToString() == k } }.forEach { a ->
+                      val c = cell(this); bind(c, a, ds, U.b("dlabels", false))
+                      dock.addView(c, LinearLayout.LayoutParams(0, -2, 1f)) }
+                  filter()
+              }
+          
+              private fun filter() {
+                  val hid = hidden(); val q = search.text.toString().trim().lowercase()
+                  var l = all.filter { it.cn.flattenToString() !in hid }
+                  if (q.isNotEmpty()) l = l.filter { it.label.lowercase().contains(q) }
+                  ad.list = when (U.s("sort", "A–Z")) {
+                      "Z–A" -> l.sortedByDescending { it.label.lowercase() }
+                      "Mais recentes" -> l.sortedByDescending { it.t }
+                      "Mais antigos" -> l.sortedBy { it.t }
+                      else -> l.sortedBy { it.label.lowercase() } }
+                  ad.notifyDataSetChanged()
+                  if (q.isNotEmpty() && ad.list.size == 1 && U.b("auto", false)) launch(search, ad.list[0])
+              }
+          
+              private fun launch(v: View, a: App) {
+                  val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setComponent(a.cn)
+                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  val o = if (U.b("anim", true)) ActivityOptions.makeScaleUpAnimation(v, 0, 0, v.width, v.height).toBundle() else null
+                  try { startActivity(i, o) } catch (e: Exception) { toast("Não foi possível abrir") }
+              }
+          
+              private fun menu(a: App) {
+                  val k = a.cn.flattenToString(); val p = "package:" + a.cn.packageName
+                  val inDock = k in dockKeys()
+                  AlertDialog.Builder(this).setTitle(a.label).setItems(arrayOf("Desinstalar", "Informações do app",
+                      if (inDock) "Remover da dock" else "Adicionar à dock", "Ocultar app")) { _, w ->
+                      when (w) {
+                          0 -> startActivity(Intent(Intent.ACTION_DELETE, Uri.parse(p)))
+                          1 -> startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse(p)))
+                          2 -> { val l = dockKeys().toMutableList()
+                              if (inDock) l.remove(k) else if (l.size < 5) l.add(k) else toast("Dock cheia (máx. 5)")
+                              U.sp.edit().putString("dock", l.joinToString(",")).apply(); render() }
+                          3 -> { U.sp.edit().putStringSet("hidden", hidden() + k).apply(); render() }
+                          else -> {} } }.show()
+              }
+          
+              private fun cell(c: Context) = LinearLayout(c).apply {
+                  orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
+                  addView(ImageView(c).apply { id = 1001 })
+                  addView(TextView(c).apply { id = 1002; maxLines = 1; ellipsize = TextUtils.TruncateAt.END; gravity = Gravity.CENTER }) }
+          
+              private fun bind(v: View, a: App, size: Int, labels: Boolean) {
+                  val ic = v.findViewById<ImageView>(1001); val tv = v.findViewById<TextView>(1002)
+                  if (ic.layoutParams.width != size) ic.layoutParams = LinearLayout.LayoutParams(size, size)
+                  val sh = U.s("shape", "Squircle")
+                  if (sh == "Original") ic.clipToOutline = false else {
+                      ic.outlineProvider = prov.getOrPut(sh) { object : ViewOutlineProvider() {
+                          override fun getOutline(x: View, o: Outline) { val w = x.width
+                              when (sh) { "Círculo" -> o.setOval(0, 0, w, w); "Quadrado" -> o.setRect(0, 0, w, w)
+                                  "Arredondado" -> o.setRoundRect(0, 0, w, w, w * .18f); else -> o.setRoundRect(0, 0, w, w, w * .3f) } } } }
+                      ic.clipToOutline = true }
+                  val sc = U.i("scale", 100) / 100f; val g = dp(U.i("vgap", 8) * sc)
+                  v.setPadding(dp(2f), g, dp(2f), g)
+                  tv.visibility = if (labels) View.VISIBLE else View.GONE
+                  tv.textSize = U.i("tsize", 12) * sc
+                  tv.setTextColor(U.colors[U.s("tcolor", "Branco")] ?: -1)
+                  tv.setShadowLayer(if (U.b("shadow", true)) 4f else 0f, 0f, 1f, 0xCC000000.toInt())
+                  tv.text = a.label
+                  val key = a.cn.flattenToString(); ic.tag = key
+                  val c = U.cache.get(key)
+                  if (c != null) ic.setImageDrawable(fresh(c)) else { ic.setImageDrawable(null)
+                      U.io.execute { val d = a.icon(); U.cache.put(key, d); U.ui.post { if (ic.tag == key) ic.setImageDrawable(fresh(d)) } } }
+                  v.setOnClickListener { launch(v, a) }
+                  v.setOnLongClickListener { if (U.b("haptic", true)) v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                      menu(a); true }
+              }
+          
+              private fun isz() = dp(U.i("icon", 56) * (U.i("scale", 100) / 100f))
+          
+              private inner class Ad : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+                  var list = listOf<App>()
+                  override fun onCreateViewHolder(p: ViewGroup, t: Int): RecyclerView.ViewHolder {
+                      val v = cell(p.context); v.layoutParams = RecyclerView.LayoutParams(-1, -2)
+                      return object : RecyclerView.ViewHolder(v) {} }
+                  override fun getItemCount() = list.size
+                  override fun onBindViewHolder(h: RecyclerView.ViewHolder, i: Int) = bind(h.itemView, list[i], isz(), U.b("labels", true))
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/lite/launcher/SettingsActivity.kt <<'EOF'
+          package com.lite.launcher
+          
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.View
+          import android.widget.*
+          
+          class Opt(val k: String, val t: String, val d: Any = 0, val a: Int = 0, val b: Int = 0,
+                    val ch: List<String> = emptyList(), val u: String = "")
+          
+          val OPTS = listOf(
+              Opt("#", "INTERFACE"),
+              Opt("scale", "Tamanho da interface", 100, 80, 140, u = "%"),
+              Opt("dim", "Escurecer o fundo", 15, 0, 80, u = "%"),
+              Opt("hidesb", "Ocultar barra de status", false),
+              Opt("anim", "Animação ao abrir apps", true),
+              Opt("haptic", "Vibrar no toque longo", true),
+              Opt("top", "Voltar ao topo ao tocar em Home", true),
+              Opt("#", "ÍCONES"),
+              Opt("cols", "Colunas", 4, 3, 6),
+              Opt("icon", "Tamanho do ícone", 56, 32, 96, u = " dp"),
+              Opt("shape", "Formato do ícone", "Squircle", ch = listOf("Squircle", "Arredondado", "Círculo", "Quadrado", "Original")),
+              Opt("labels", "Mostrar nomes", true),
+              Opt("tsize", "Tamanho do texto", 12, 9, 16, u = " sp"),
+              Opt("tcolor", "Cor do texto", "Branco", ch = listOf("Branco", "Preto", "Cinza", "Amarelo")),
+              Opt("shadow", "Sombra no texto", true),
+              Opt("vgap", "Espaço vertical", 8, 0, 24, u = " dp"),
+              Opt("side", "Margem lateral", 8, 0, 32, u = " dp"),
+              Opt("sort", "Ordem dos apps", "A–Z", ch = listOf("A–Z", "Z–A", "Mais recentes", "Mais antigos")),
+              Opt("#", "DOCK"),
+              Opt("dock", "Mostrar dock", true),
+              Opt("dicon", "Tamanho dos ícones da dock", 56, 36, 72, u = " dp"),
+              Opt("dalpha", "Opacidade da dock", 40, 0, 100, u = "%"),
+              Opt("dround", "Cantos da dock", 24, 0, 40, u = " dp"),
+              Opt("dtheme", "Cor da dock", "Escuro", ch = listOf("Escuro", "Claro", "Transparente")),
+              Opt("dlabels", "Nomes na dock", false),
+              Opt("#", "BUSCA"),
+              Opt("search", "Mostrar barra Buscar", true),
+              Opt("kbd", "Abrir teclado ao buscar", true),
+              Opt("auto", "Abrir app se só houver 1 resultado", false),
+              Opt("#", "AÇÕES"),
+              Opt("!wall", "Trocar papel de parede"),
+              Opt("!home", "Definir como launcher padrão"),
+              Opt("!hid", "Mostrar apps ocultos"),
+              Opt("!reset", "Restaurar padrões"))
+          
+          class SettingsActivity : Activity() {
+              private fun dp(v: Float) = (v * resources.displayMetrics.density).toInt()
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+              private fun tv(t: String, sz: Float = 16f) = TextView(this).apply {
+                  text = t; textSize = sz; setPadding(dp(20f), dp(12f), dp(20f), dp(12f)) }
+          
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s); U.init(this); title = "Configurações"
+                  val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  OPTS.forEach { box.addView(row(it)) }
+                  setContentView(ScrollView(this).apply { addView(box) })
+              }
+          
+              private fun row(o: Opt): View = when {
+                  o.k == "#" -> tv(o.t, 13f).apply { setTypeface(null, Typeface.BOLD)
+                      setTextColor(0xFF1A73E8.toInt()); setPadding(dp(20f), dp(20f), dp(20f), dp(4f)) }
+                  o.k[0] == '!' -> tv(o.t).apply { setOnClickListener { act(o.k) } }
+                  o.d is Boolean -> Switch(this).apply { text = o.t; textSize = 16f
+                      setPadding(dp(20f), dp(12f), dp(20f), dp(12f)); isChecked = U.b(o.k, o.d)
+                      setOnCheckedChangeListener { _, c -> U.sp.edit().putBoolean(o.k, c).apply() } }
+                  o.ch.isNotEmpty() -> tv("").apply {
+                      fun up() { text = "${o.t}: ${U.s(o.k, o.d as String)}" }
+                      up()
+                      setOnClickListener { AlertDialog.Builder(this@SettingsActivity).setTitle(o.t)
+                          .setItems(o.ch.toTypedArray()) { _, i -> U.sp.edit().putString(o.k, o.ch[i]).apply(); up() }.show() } }
+                  else -> LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      val l = tv(""); val sb = SeekBar(this@SettingsActivity)
+                      fun up(v: Int) { l.text = "${o.t}: $v${o.u}" }
+                      val cur = U.i(o.k, o.d as Int)
+                      up(cur); sb.max = o.b - o.a; sb.progress = cur - o.a
+                      sb.setPadding(dp(20f), 0, dp(20f), dp(8f))
+                      sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
+                              U.sp.edit().putInt(o.k, p + o.a).apply(); up(p + o.a) }
+                          override fun onStartTrackingTouch(s: SeekBar?) {}
+                          override fun onStopTrackingTouch(s: SeekBar?) {} })
+                      addView(l); addView(sb) }
+              }
+          
+              private fun act(k: String) {
+                  when (k) {
+                      "!wall" -> startActivity(Intent.createChooser(Intent(Intent.ACTION_SET_WALLPAPER), "Papel de parede"))
+                      "!home" -> startActivity(Intent(Settings.ACTION_HOME_SETTINGS))
+                      "!hid" -> {
+                          val h = (U.sp.getStringSet("hidden", emptySet()) ?: emptySet()).toList()
+                          if (h.isEmpty()) toast("Nenhum app oculto") else {
+                              val names = h.map { x -> val p = ComponentName.unflattenFromString(x)!!.packageName
+                                  try { packageManager.getApplicationLabel(packageManager.getApplicationInfo(p, 0)).toString() } catch (e: Exception) { p } }
+                              AlertDialog.Builder(this).setTitle("Mostrar app").setItems(names.toTypedArray()) { _, i ->
+                                  U.sp.edit().putStringSet("hidden", h.toSet() - h[i]).apply(); toast("Reexibido") }.show() } }
+                      "!reset" -> { U.sp.edit().clear().apply(); recreate() }
+                  }
+              }
+          }
+          EOF
+      - name: Compilar
+        working-directory: LiteLauncher
+        run: gradle assembleDebug
       - uses: actions/upload-artifact@v4
         with:
           name: LiteLauncher-apk
-          path: "**/app-debug.apk"
+          path: LiteLauncher/app/build/outputs/apk/debug/app-debug.apk
